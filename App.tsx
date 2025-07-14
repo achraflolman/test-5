@@ -1,4 +1,5 @@
 
+
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { onAuthStateChanged, signOut, type User, sendEmailVerification, reauthenticateWithCredential, deleteUser } from 'firebase/auth';
 import { doc, onSnapshot, collection, query, where, orderBy, limit, type Unsubscribe, setDoc, writeBatch, Timestamp, getDocs, getDoc, deleteDoc } from '@firebase/firestore';
@@ -765,21 +766,41 @@ const App: React.FC = () => {
                     setUser(tempAdminUser);
                     
                     const adminSettingsRef = doc(db, `artifacts/${appId}/admin/settings`);
-                    profileUnsubscribe = onSnapshot(adminSettingsRef, async (docSnap) => {
+
+                    // Use getDoc for initial load for more robust error handling
+                    try {
+                        const docSnap = await getDoc(adminSettingsRef);
+                        let settingsData: AdminSettings;
+
                         if (docSnap.exists()) {
-                            setAdminSettings(docSnap.data() as AdminSettings);
+                            settingsData = docSnap.data() as AdminSettings;
                         } else {
+                            // Settings doc doesn't exist, create it with defaults
                             const defaultAdminSettings: AdminSettings = { themePreference: 'purple', pinProtectionEnabled: true, fontPreference: 'inter' };
                             await setDoc(adminSettingsRef, defaultAdminSettings);
-                            setAdminSettings(defaultAdminSettings);
+                            settingsData = defaultAdminSettings;
                         }
+                        
+                        setAdminSettings(settingsData);
                         setFinalStatus('authenticated');
-                    }, (error) => {
+
+                        // Now, attach onSnapshot for real-time updates. Errors here are not fatal.
+                        profileUnsubscribe = onSnapshot(adminSettingsRef, (snapshot) => {
+                            if (snapshot.exists()) {
+                                setAdminSettings(snapshot.data() as AdminSettings);
+                            }
+                        }, (error) => {
+                            console.error("Real-time admin settings listener failed:", error);
+                            // Optional: Show a non-blocking toast message that updates failed.
+                        });
+
+                    } catch (error) {
+                        // This catches fatal errors during initial load
                         console.error("Fatal Admin Settings Load Error:", error);
                         showAppModal({ text: 'Admin login failed. Could not load settings. Please check your connection.' });
                         signOut(auth);
                         setFinalStatus('unauthenticated');
-                    });
+                    }
 
                     return;
                 }
