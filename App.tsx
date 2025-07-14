@@ -1,7 +1,7 @@
 
-
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { onAuthStateChanged, signOut, type User, sendEmailVerification, reauthenticateWithCredential, deleteUser } from 'firebase/auth';
+import firebase from 'firebase/compat/app';
+import 'firebase/compat/auth';
 import { doc, onSnapshot, collection, query, where, orderBy, limit, type Unsubscribe, setDoc, writeBatch, Timestamp, getDocs, getDoc, deleteDoc } from '@firebase/firestore';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 import { Menu, LogOut, Camera, Bell, Flame, Loader2 } from 'lucide-react';
@@ -262,7 +262,7 @@ const ReauthModal: React.FC<{
 
         try {
             const credential = EmailAuthProvider.credential(auth.currentUser.email, password);
-            await reauthenticateWithCredential(auth.currentUser, credential);
+            await auth.currentUser.reauthenticateWithCredential(credential);
             onSuccess();
             onClose();
         } catch (error) {
@@ -301,14 +301,6 @@ const ReauthModal: React.FC<{
     );
 };
 
-const getInitialShowIntro = () => {
-    try {
-        return localStorage.getItem('schoolmaps_intro_seen') !== 'true';
-    } catch (e) {
-        // If localStorage is not available, default to showing the intro for first-time users.
-        return true;
-    }
-};
 
 const App: React.FC = () => {
     // Top-level app state
@@ -324,7 +316,8 @@ const App: React.FC = () => {
     const [isBroadcastModalOpen, setIsBroadcastModalOpen] = useState(false);
     const [selectedBroadcast, setSelectedBroadcast] = useState<BroadcastData | null>(null);
     const [isOnline, setIsOnline] = useState(navigator.onLine);
-    const [showIntro, setShowIntro] = useState(getInitialShowIntro);
+    const [showIntro, setShowIntro] = useState(false);
+    const [introChecked, setIntroChecked] = useState(false);
     const [isUserDetailModalOpen, setIsUserDetailModalOpen] = useState(false);
     const [selectedUserForDetail, setSelectedUserForDetail] = useState<AppUser | null>(null);
     const [isPinVerificationModalOpen, setIsPinVerificationModalOpen] = useState(false);
@@ -351,6 +344,10 @@ const App: React.FC = () => {
     const [isTimerActive, setIsTimerActive] = useState(false);
     const [selectedTaskForTimer, setSelectedTaskForTimer] = useState<ToDoTask | null>(null);
     const timerAudioRef = useRef<HTMLAudioElement | null>(null);
+
+    // Initial Loading states
+    const [isAppReadyForDisplay, setIsAppReadyForDisplay] = useState(false);
+    const [isMinLoadingTimePassed, setIsMinLoadingTimePassed] = useState(false);
 
 
     // Memoized theme and translation functions
@@ -425,6 +422,19 @@ const App: React.FC = () => {
     }, []);
 
     useEffect(() => {
+        const timer = setTimeout(() => {
+            setIsMinLoadingTimePassed(true);
+        }, 4000);
+        return () => clearTimeout(timer);
+    }, []);
+
+    useEffect(() => {
+        if (appStatus !== 'initializing' && introChecked) {
+            setIsAppReadyForDisplay(true);
+        }
+    }, [appStatus, introChecked]);
+
+    useEffect(() => {
         timerAudioRef.current = new Audio('https://assets.mixkit.co/sfx/preview/mixkit-clear-announce-tones-2861.mp3');
     }, []);
 
@@ -482,7 +492,7 @@ const App: React.FC = () => {
             text: t('confirm_logout'),
             confirmAction: async () => {
                 sessionStorage.setItem('logout-event', 'true');
-                await signOut(auth);
+                await auth.signOut();
                 setIsAdmin(false);
                 setIsPinVerified(false);
                 setAdminSettings(null);
@@ -542,7 +552,7 @@ const App: React.FC = () => {
                     const newNotifRef = doc(userNotifsRef);
                     batch.set(newNotifRef, {
                         title: broadcastData.title,
-                        text: broadcastData.message,
+                        message: broadcastData.message,
                         type: 'admin', read: false,
                         createdAt: broadcastData.createdAt,
                         broadcastId: broadcastId,
@@ -704,7 +714,7 @@ const App: React.FC = () => {
 
         // Delete all private user collections
         const userRoot = `artifacts/${appId}/users/${uid}`;
-        const collectionsToDelete = ['calendarEvents', 'notes', 'tasks', 'flashcardDecks'];
+        const collectionsToDelete = ['calendarEvents', 'notes', 'tasks', 'notifications', 'flashcardDecks'];
         for (const coll of collectionsToDelete) {
             const snapshot = await getDocs(collection(db, `${userRoot}/${coll}`));
             snapshot.forEach(doc => mainBatch.delete(doc.ref));
@@ -727,7 +737,7 @@ const App: React.FC = () => {
 
         try {
             await deleteUserData(currentUser.uid);
-            await deleteUser(currentUser);
+            await currentUser.delete();
             showAppModal({ text: t('success_account_deleted') });
         } catch (error) {
             console.error("Account deletion failed:", error);
@@ -739,18 +749,10 @@ const App: React.FC = () => {
     // Main authentication and profile loading effect
     useEffect(() => {
         let profileUnsubscribe: Unsubscribe | undefined;
-        const startTime = Date.now();
 
-        const authSubscriber = onAuthStateChanged(auth, async (firebaseUser) => {
+        const authSubscriber = auth.onAuthStateChanged(async (firebaseUser) => {
             if (profileUnsubscribe) profileUnsubscribe();
-
-            const setFinalStatus = (status: AppStatus) => {
-                const elapsedTime = Date.now() - startTime;
-                const delay = Math.max(0, 4000 - elapsedTime);
-                setTimeout(() => {
-                    setAppStatus(status);
-                }, delay);
-            };
+            setAppStatus('initializing');
 
             if (firebaseUser) {
                 if (firebaseUser.email === 'admin1069@gmail.com') {
@@ -765,42 +767,24 @@ const App: React.FC = () => {
                     } as AppUser;
                     setUser(tempAdminUser);
                     
+                    // Use onSnapshot for resilient settings fetching
                     const adminSettingsRef = doc(db, `artifacts/${appId}/admin/settings`);
-
-                    // Use getDoc for initial load for more robust error handling
-                    try {
-                        const docSnap = await getDoc(adminSettingsRef);
-                        let settingsData: AdminSettings;
-
+                    profileUnsubscribe = onSnapshot(adminSettingsRef, async (docSnap) => {
                         if (docSnap.exists()) {
-                            settingsData = docSnap.data() as AdminSettings;
+                            setAdminSettings(docSnap.data() as AdminSettings);
                         } else {
-                            // Settings doc doesn't exist, create it with defaults
+                            // Create default settings if they don't exist
                             const defaultAdminSettings: AdminSettings = { themePreference: 'purple', pinProtectionEnabled: true, fontPreference: 'inter' };
                             await setDoc(adminSettingsRef, defaultAdminSettings);
-                            settingsData = defaultAdminSettings;
+                            setAdminSettings(defaultAdminSettings);
                         }
-                        
-                        setAdminSettings(settingsData);
-                        setFinalStatus('authenticated');
-
-                        // Now, attach onSnapshot for real-time updates. Errors here are not fatal.
-                        profileUnsubscribe = onSnapshot(adminSettingsRef, (snapshot) => {
-                            if (snapshot.exists()) {
-                                setAdminSettings(snapshot.data() as AdminSettings);
-                            }
-                        }, (error) => {
-                            console.error("Real-time admin settings listener failed:", error);
-                            // Optional: Show a non-blocking toast message that updates failed.
-                        });
-
-                    } catch (error) {
-                        // This catches fatal errors during initial load
+                        setAppStatus('authenticated'); // Transition to authenticated state ONLY after settings are loaded.
+                    }, (error) => {
                         console.error("Fatal Admin Settings Load Error:", error);
                         showAppModal({ text: 'Admin login failed. Could not load settings. Please check your connection.' });
-                        signOut(auth);
-                        setFinalStatus('unauthenticated');
-                    }
+                        auth.signOut();
+                        setAppStatus('unauthenticated');
+                    });
 
                     return;
                 }
@@ -812,7 +796,7 @@ const App: React.FC = () => {
                         userName: firebaseUser.displayName || t('guest_fallback_name'),
                     } as AppUser;
                     setUser(tempUser);
-                    setFinalStatus('awaiting-verification');
+                    setAppStatus('awaiting-verification');
                     return;
                 }
 
@@ -823,9 +807,9 @@ const App: React.FC = () => {
                     if (docSnap.exists()) {
                         const userData = docSnap.data() as AppUser;
                         if (userData.disabled) {
-                            await signOut(auth);
+                            await auth.signOut();
                             showAppModal({ text: t('error_account_disabled') });
-                            setFinalStatus('unauthenticated');
+                            setAppStatus('unauthenticated');
                             return;
                         }
                         
@@ -883,11 +867,11 @@ const App: React.FC = () => {
                          await setDoc(userDocRef, finalUser, { merge: true });
                     }
                     setUser(finalUser);
-                    setFinalStatus('authenticated');
+                    setAppStatus('authenticated');
                 }, (error) => {
                     console.error("Firestore profile snapshot error:", error);
                     showAppModal({ text: t('error_profile_load_failed') });
-                    setFinalStatus('unauthenticated');
+                    setAppStatus('unauthenticated');
                 });
             } else {
                 setUser(null);
@@ -897,7 +881,7 @@ const App: React.FC = () => {
                     showAppModal({ text: t('success_logout') });
                     sessionStorage.removeItem('logout-event');
                 }
-                setFinalStatus('unauthenticated');
+                setAppStatus('unauthenticated');
             }
         });
 
@@ -941,6 +925,19 @@ const App: React.FC = () => {
         return false;
     }, [showAppModal, t]);
     
+    useEffect(() => {
+        try {
+            const introSeen = localStorage.getItem('schoolmaps_intro_seen');
+            if (introSeen !== 'true') {
+                setShowIntro(true);
+            }
+        } catch (error) {
+            setShowIntro(false);
+        } finally {
+            setIntroChecked(true);
+        }
+    }, []);
+
     const appFontFamily = isAdmin ? (adminSettings?.fontPreference || 'inter') : fontFamily;
     // Determine the font class based on auth status. Default to 'inter' for unauthenticated views (login, intro, etc.).
     const activeFontClass = appStatus === 'authenticated' ? (fontClasses[appFontFamily] || 'font-inter') : 'font-inter';
@@ -949,6 +946,8 @@ const App: React.FC = () => {
     const authContainerClasses = (appStatus === 'unauthenticated' || appStatus === 'initializing' || appStatus === 'awaiting-verification' || (showIntro && !user) ) ? getAuthThemeClasses('bg') : '';
 
     const mainAppLayoutProps = { user, t, getThemeClasses, showAppModal, closeAppModal, tSubject, copyTextToClipboard, setIsProfilePicModalOpen, language, setLanguage, themeColor, setThemeColor, fontFamily, setFontFamily, handleLogout, handleGoHome, currentView, setCurrentView, currentSubject, setCurrentSubject, subjectFiles, searchQuery, setSearchQuery, userEvents, recentFiles, onProfileUpdate: handleProfileUpdate, onDeleteAccountRequest: () => setIsReauthModalOpen(true), notifications, unreadCount, showBroadcast: showBroadcastModal, focusMinutes, setFocusMinutes, breakMinutes, setBreakMinutes, timerMode, setTimerMode, timeLeft, setTimeLeft, isTimerActive, setIsTimerActive, selectedTaskForTimer, setSelectedTaskForTimer};
+    
+    const isLoading = !isAppReadyForDisplay || !isMinLoadingTimePassed;
 
     return (
         <div className={`${appContainerClasses} ${authContainerClasses}`}>
@@ -964,64 +963,68 @@ const App: React.FC = () => {
             <UserDetailModal isOpen={isUserDetailModalOpen} onClose={() => setIsUserDetailModalOpen(false)} user={selectedUserForDetail} {...{t, tSubject, getThemeClasses, showAppModal}} />
             <PinVerificationModal isOpen={isPinVerificationModalOpen} onClose={() => setIsPinVerificationModalOpen(false)} onSuccess={handlePinDisableConfirm} t={t} getThemeClasses={getThemeClasses} />
             
-            {(appStatus === 'initializing') && <LoadingScreen getThemeClasses={getAuthThemeClasses} />}
+            {isLoading && <LoadingScreen getThemeClasses={getAuthThemeClasses} />}
             
-            {appStatus === 'awaiting-verification' && user && (
-                 <EmailVerificationView 
-                    user={user}
-                    t={t}
-                    getThemeClasses={getAuthThemeClasses}
-                    handleLogout={handleLogout}
-                 />
-            )}
-
-            {appStatus === 'unauthenticated' && (
-                showIntro ? (
-                    <IntroTutorialView
-                        onFinish={handleIntroFinish}
+            {!isLoading && (
+              <>
+                {appStatus === 'awaiting-verification' && user && (
+                     <EmailVerificationView 
+                        user={user}
                         t={t}
                         getThemeClasses={getAuthThemeClasses}
-                    />
-                ) : (
-                    <AuthView {...{ showAppModal, t, getThemeClasses: getAuthThemeClasses, tSubject }} />
-                )
-            )}
-            
-            {appStatus === 'authenticated' && user && (
-                 isAdmin && adminSettings ? (
-                    adminSettings.pinProtectionEnabled && !isPinVerified ? (
-                        <AdminPinView 
-                            user={user}
-                            onSuccess={() => setIsPinVerified(true)}
+                        handleLogout={handleLogout}
+                     />
+                )}
+
+                {appStatus === 'unauthenticated' && introChecked && (
+                    showIntro ? (
+                        <IntroTutorialView
+                            onFinish={handleIntroFinish}
                             t={t}
-                            getThemeClasses={getThemeClasses}
+                            getThemeClasses={getAuthThemeClasses}
                         />
                     ) : (
-                        <AdminView 
-                            user={user} 
-                            t={t} 
-                            handleLogout={handleLogout} 
-                            getThemeClasses={getThemeClasses} 
-                            showAppModal={showAppModal} 
-                            tSubject={tSubject} 
-                            onUserClick={handleUserDetailClick}
-                            adminSettings={adminSettings}
-                            onAdminSettingsUpdate={handleAdminSettingsUpdate}
-                            onPinDisableRequest={handlePinDisableRequest}
-                         />
+                        <AuthView {...{ showAppModal, t, getThemeClasses: getAuthThemeClasses, tSubject }} />
                     )
-                 ) : user && !isAdmin ? (
-                    <>
-                        <MainAppLayout {...mainAppLayoutProps} />
-                        <ProfilePicModal 
-                            isOpen={isProfilePicModalOpen} 
-                            onClose={() => setIsProfilePicModalOpen(false)}
-                            t={t}
-                            getThemeClasses={getThemeClasses}
-                            handleProfilePicUpload={handleProfilePicUpload}
-                        />
-                    </>
-                ) : <LoadingScreen getThemeClasses={getAuthThemeClasses}/>
+                )}
+                
+                {appStatus === 'authenticated' && user && (
+                     isAdmin && adminSettings ? (
+                        adminSettings.pinProtectionEnabled && !isPinVerified ? (
+                            <AdminPinView 
+                                user={user}
+                                onSuccess={() => setIsPinVerified(true)}
+                                t={t}
+                                getThemeClasses={getThemeClasses}
+                            />
+                        ) : (
+                            <AdminView 
+                                user={user} 
+                                t={t} 
+                                handleLogout={handleLogout} 
+                                getThemeClasses={getThemeClasses} 
+                                showAppModal={showAppModal} 
+                                tSubject={tSubject} 
+                                onUserClick={handleUserDetailClick}
+                                adminSettings={adminSettings}
+                                onAdminSettingsUpdate={handleAdminSettingsUpdate}
+                                onPinDisableRequest={handlePinDisableRequest}
+                             />
+                        )
+                     ) : user && !isAdmin ? (
+                        <>
+                            <MainAppLayout {...mainAppLayoutProps} />
+                            <ProfilePicModal 
+                                isOpen={isProfilePicModalOpen} 
+                                onClose={() => setIsProfilePicModalOpen(false)}
+                                t={t}
+                                getThemeClasses={getThemeClasses}
+                                handleProfilePicUpload={handleProfilePicUpload}
+                            />
+                        </>
+                    ) : <LoadingScreen getThemeClasses={getAuthThemeClasses}/>
+                )}
+            </>
             )}
             <OfflineIndicator isOnline={isOnline} t={t} />
         </div>
