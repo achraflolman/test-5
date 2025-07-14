@@ -300,6 +300,14 @@ const ReauthModal: React.FC<{
     );
 };
 
+const getInitialShowIntro = () => {
+    try {
+        return localStorage.getItem('schoolmaps_intro_seen') !== 'true';
+    } catch (e) {
+        // If localStorage is not available, default to showing the intro for first-time users.
+        return true;
+    }
+};
 
 const App: React.FC = () => {
     // Top-level app state
@@ -315,8 +323,7 @@ const App: React.FC = () => {
     const [isBroadcastModalOpen, setIsBroadcastModalOpen] = useState(false);
     const [selectedBroadcast, setSelectedBroadcast] = useState<BroadcastData | null>(null);
     const [isOnline, setIsOnline] = useState(navigator.onLine);
-    const [showIntro, setShowIntro] = useState(false);
-    const [introChecked, setIntroChecked] = useState(false);
+    const [showIntro, setShowIntro] = useState(getInitialShowIntro);
     const [isUserDetailModalOpen, setIsUserDetailModalOpen] = useState(false);
     const [selectedUserForDetail, setSelectedUserForDetail] = useState<AppUser | null>(null);
     const [isPinVerificationModalOpen, setIsPinVerificationModalOpen] = useState(false);
@@ -696,7 +703,7 @@ const App: React.FC = () => {
 
         // Delete all private user collections
         const userRoot = `artifacts/${appId}/users/${uid}`;
-        const collectionsToDelete = ['calendarEvents', 'notes', 'tasks', 'notifications', 'flashcardDecks'];
+        const collectionsToDelete = ['calendarEvents', 'notes', 'tasks', 'flashcardDecks'];
         for (const coll of collectionsToDelete) {
             const snapshot = await getDocs(collection(db, `${userRoot}/${coll}`));
             snapshot.forEach(doc => mainBatch.delete(doc.ref));
@@ -731,10 +738,18 @@ const App: React.FC = () => {
     // Main authentication and profile loading effect
     useEffect(() => {
         let profileUnsubscribe: Unsubscribe | undefined;
+        const startTime = Date.now();
 
         const authSubscriber = onAuthStateChanged(auth, async (firebaseUser) => {
             if (profileUnsubscribe) profileUnsubscribe();
-            setAppStatus('initializing');
+
+            const setFinalStatus = (status: AppStatus) => {
+                const elapsedTime = Date.now() - startTime;
+                const delay = Math.max(0, 4000 - elapsedTime);
+                setTimeout(() => {
+                    setAppStatus(status);
+                }, delay);
+            };
 
             if (firebaseUser) {
                 if (firebaseUser.email === 'admin1069@gmail.com') {
@@ -749,23 +764,21 @@ const App: React.FC = () => {
                     } as AppUser;
                     setUser(tempAdminUser);
                     
-                    // Use onSnapshot for resilient settings fetching
                     const adminSettingsRef = doc(db, `artifacts/${appId}/admin/settings`);
                     profileUnsubscribe = onSnapshot(adminSettingsRef, async (docSnap) => {
                         if (docSnap.exists()) {
                             setAdminSettings(docSnap.data() as AdminSettings);
                         } else {
-                            // Create default settings if they don't exist
                             const defaultAdminSettings: AdminSettings = { themePreference: 'purple', pinProtectionEnabled: true, fontPreference: 'inter' };
                             await setDoc(adminSettingsRef, defaultAdminSettings);
                             setAdminSettings(defaultAdminSettings);
                         }
-                        setAppStatus('authenticated'); // Transition to authenticated state ONLY after settings are loaded.
+                        setFinalStatus('authenticated');
                     }, (error) => {
                         console.error("Fatal Admin Settings Load Error:", error);
                         showAppModal({ text: 'Admin login failed. Could not load settings. Please check your connection.' });
                         signOut(auth);
-                        setAppStatus('unauthenticated');
+                        setFinalStatus('unauthenticated');
                     });
 
                     return;
@@ -778,7 +791,7 @@ const App: React.FC = () => {
                         userName: firebaseUser.displayName || t('guest_fallback_name'),
                     } as AppUser;
                     setUser(tempUser);
-                    setAppStatus('awaiting-verification');
+                    setFinalStatus('awaiting-verification');
                     return;
                 }
 
@@ -791,7 +804,7 @@ const App: React.FC = () => {
                         if (userData.disabled) {
                             await signOut(auth);
                             showAppModal({ text: t('error_account_disabled') });
-                            setAppStatus('unauthenticated');
+                            setFinalStatus('unauthenticated');
                             return;
                         }
                         
@@ -849,11 +862,11 @@ const App: React.FC = () => {
                          await setDoc(userDocRef, finalUser, { merge: true });
                     }
                     setUser(finalUser);
-                    setAppStatus('authenticated');
+                    setFinalStatus('authenticated');
                 }, (error) => {
                     console.error("Firestore profile snapshot error:", error);
                     showAppModal({ text: t('error_profile_load_failed') });
-                    setAppStatus('unauthenticated');
+                    setFinalStatus('unauthenticated');
                 });
             } else {
                 setUser(null);
@@ -863,7 +876,7 @@ const App: React.FC = () => {
                     showAppModal({ text: t('success_logout') });
                     sessionStorage.removeItem('logout-event');
                 }
-                setAppStatus('unauthenticated');
+                setFinalStatus('unauthenticated');
             }
         });
 
@@ -907,19 +920,6 @@ const App: React.FC = () => {
         return false;
     }, [showAppModal, t]);
     
-    useEffect(() => {
-        try {
-            const introSeen = localStorage.getItem('schoolmaps_intro_seen');
-            if (introSeen !== 'true') {
-                setShowIntro(true);
-            }
-        } catch (error) {
-            setShowIntro(false);
-        } finally {
-            setIntroChecked(true);
-        }
-    }, []);
-
     const appFontFamily = isAdmin ? (adminSettings?.fontPreference || 'inter') : fontFamily;
     // Determine the font class based on auth status. Default to 'inter' for unauthenticated views (login, intro, etc.).
     const activeFontClass = appStatus === 'authenticated' ? (fontClasses[appFontFamily] || 'font-inter') : 'font-inter';
@@ -943,7 +943,7 @@ const App: React.FC = () => {
             <UserDetailModal isOpen={isUserDetailModalOpen} onClose={() => setIsUserDetailModalOpen(false)} user={selectedUserForDetail} {...{t, tSubject, getThemeClasses, showAppModal}} />
             <PinVerificationModal isOpen={isPinVerificationModalOpen} onClose={() => setIsPinVerificationModalOpen(false)} onSuccess={handlePinDisableConfirm} t={t} getThemeClasses={getThemeClasses} />
             
-            {(appStatus === 'initializing' || !introChecked) && <LoadingScreen getThemeClasses={getAuthThemeClasses} />}
+            {(appStatus === 'initializing') && <LoadingScreen getThemeClasses={getAuthThemeClasses} />}
             
             {appStatus === 'awaiting-verification' && user && (
                  <EmailVerificationView 
@@ -954,7 +954,7 @@ const App: React.FC = () => {
                  />
             )}
 
-            {appStatus === 'unauthenticated' && introChecked && (
+            {appStatus === 'unauthenticated' && (
                 showIntro ? (
                     <IntroTutorialView
                         onFinish={handleIntroFinish}
